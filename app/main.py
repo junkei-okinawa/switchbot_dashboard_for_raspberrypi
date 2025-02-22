@@ -1,13 +1,13 @@
-import json
-import logging
 import os
-from time import sleep
+import asyncio
+import logging
 
 import schedule
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
-from switchbot import Switchbot
+from switchbot.discovery import GetSwitchbotDevices
+import dbus.exceptions
 
 # Logging
 formatter = "[%(levelname)-8s] %(asctime)s %(funcName)s %(message)s"
@@ -24,52 +24,48 @@ write_api = client.write_api(write_options=SYNCHRONOUS)
 query_api = client.query_api()
 
 # SwitchBot
-ACCESS_TOKEN: str = os.environ["SWITCHBOT_ACCESS_TOKEN"]
-SECRET: str = os.environ["SWITCHBOT_SECRET"]
 
-
-def save_device_status(status: dict):
+def save_device_status(status: dict, device_id: str, device_name: str):
     """SwitchbotデバイスのステータスをInfluxDBに保存する"""
+    logging.info(f"Save: {status}")
+    p = (
+        Point(device_name)
+        .tag("device_id", device_id)
+        .field("humidity", float(status["humidity"]))
+        .field("temperature", float(status["temperature"]))
+    )
 
-    device_type = status.get("deviceType")
+    if "battery" in status:
+        p = p.field("battery", float(status["battery"]))
 
-    if device_type == "MeterPlus":
-        p = (
-            Point("MeterPlus")
-            .tag("device_id", status["deviceId"])
-            .field("humidity", float(status["humidity"]))
-            .field("temperature", float(status["temperature"]))
-        )
+    write_api.write(bucket=bucket, record=p)
+    logging.info(f"Saved: {status}")
 
-        write_api.write(bucket=bucket, record=p)
-        logging.info(f"Saved: {status}")
-
-
-def task():
+async def task():
     """定期実行するタスク"""
-    bot = Switchbot(ACCESS_TOKEN, SECRET)
-
-    with open("device_list.json", "r") as f:
-        device_list = json.load(f)
-
-    for d in device_list:
-        device_type = d.get("deviceType")
-        if device_type == "MeterPlus":
-            try:
-                status = bot.get_device_status(d.get("deviceId"))
-            except Exception as e:
-                logging.error(f"Request error: {e}")
-                continue
-
-            try:
-                save_device_status(status)
-            except Exception as e:
+    logging.info("Run task")
+    sensors = await GetSwitchbotDevices().get_tempsensors()
+    for address in sensors:
+        try:
+            status = sensors[address].data['data']
+            device_id = sensors[address].address
+            device_name = sensors[address].data['modelFriendlyName']
+            save_device_status(status, device_id, device_name)
+        except Exception as e:
+            if isinstance(e, dbus.exceptions.DBusException):
+                logging.error(f"D-Bus error: {e}. Ensure D-Bus socket is mounted and container has necessary privileges.")
+            else:
                 logging.error(f"Save error: {e}")
 
-
-if __name__ == "__main__":
-    schedule.every(5).minutes.do(task)
+async def main():
+    logging.info("Start main")
+    schedule.every(5).minutes.do(lambda: asyncio.create_task(task()))
+    logging.info("Set schedule")
 
     while True:
         schedule.run_pending()
-        sleep(1)
+        await asyncio.sleep(1)
+
+if __name__ == "__main__":
+    logging.info("Start")
+    asyncio.run(main())
